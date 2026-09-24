@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Install the repository's spec command on the user's PATH."""
+from pathlib import Path
+import os
+
+source = Path(__file__).resolve().with_name("spec")
+destination = Path.home() / ".local/bin/spec"
+destination.parent.mkdir(parents=True, exist_ok=True)
+if destination.is_symlink() and destination.resolve() == source:
+    print(f"Already installed: {destination} -> {source}")
+elif destination.exists() or destination.is_symlink():
+    raise SystemExit(f"Refusing to replace an existing unrelated command: {destination}")
+else:
+    source.chmod(source.stat().st_mode | 0o111)
+    destination.symlink_to(source)
+    print(f"Installed: {destination} -> {source}")
+if str(destination.parent) not in os.environ.get("PATH", "").split(os.pathsep):
+    print(f"Add {destination.parent} to PATH to run spec.")

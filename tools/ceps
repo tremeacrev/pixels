@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""Repeat specification improvements until a Codex quota floor is approached."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from ceps_codex import prepare_runtime, validate_launch_configuration
+from ceps_quota import (AccountClient, QuotaError, QuotaGuard, QuotaReached,
+                        RetryableQuotaError)
+from ceps_runtime import (Attempt, CepsError, Control, RoundError, Stopped, TOKEN_FIELDS,
+                          drain_descendants, enable_supervision, make_prompt)
+from spec_git import GitError, GitRepo
+from spec_logs import BoundedJsonlLog, prune_rpc_logs
+
+REPO = HERE.parent
+MODELS = {"gpt-6-astra": "ultra", "gpt-6-luna": "max"}
+
+
+def clean(value):
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(value)).strip()
+
+
+def atomic_json(path, value):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def percentage(value):
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Use a percentage from 0 to 100.") from exc
+    if not math.isfinite(number) or not 0 <= number <= 100:
+        raise argparse.ArgumentTypeError("Use a percentage from 0 to 100.")
+    return number
+
+
+def arguments(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("percent", nargs="?", type=percentage, help="percentage usage remaining to stop at")
+    parser.add_argument("--buffer", type=percentage, default=2.0, metavar="POINTS",
+                        help="stop this many percentage points early (default: 2)")
+    parser.add_argument("--check", action="store_true", help="check models and quota without model work or Git writes")
+    parser.add_argument("--status", action="store_true", help="show the last run's saved statistics")
+    args = parser.parse_args(argv)
+    if args.status:
+        if args.percent is not None or args.check:
+            parser.error("--status does not take a percentage or --check")
+    elif args.percent is None:
+        parser.error("a remaining percentage is required, for example: ceps 20")
+    return args
+
+
+class Statistics:
+    def __init__(self, directory, floor, buffer):
+        self.directory = directory
+        self.lock = threading.RLock()
+        self.logfile = BoundedJsonlLog(directory / "events.jsonl")
+        self.started = time.monotonic()
+        self.state = {
+            "version": 1, "pid": os.getpid(), "repository": str(REPO),
+            "started_at": datetime.now(timezone.utc).isoformat(), "status": "starting",
+            "floor": floor, "buffer": buffer, "round": 0, "attempt": "",
+            "completed_rounds": 0, "failed_attempts": 0, "checkpoints": [],
+            "workers_started": 0, "workers_active": 0, "usage_incomplete_workers": 0,
+            "children_active": 0, "children_peak": 0, "parents_active": 0,
+            "fleet_width": 0, "fleet_profile": {},
+            "fleets_started": 0, "fleets_completed": 0, "fleets_failed": 0,
+            "tokens": {key: 0 for key in TOKEN_FIELDS}, "models": MODELS,
+            "quota": None, "activity": "checking prerequisites", "reason": "",
+        }
+        self.accounted = set()
+        self.active_roles = {}
+        self.last_status = 0.0
+
+    def say(self, message):
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {clean(message)}", flush=True)
+
+    def save(self):
+        with self.lock:
+            self.state["elapsed_seconds"] = round(time.monotonic() - self.started, 2)
+            self.state["updated_at"] = datetime.now(timezone.utc).isoformat()
+            atomic_json(self.directory / "stats.json", self.state)
+
+    def update(self, **changes):
+        with self.lock:
+            self.state.update(changes)
+            self.save()
+
+    def record(self, event):
+        with self.lock:
+            event = {"time": datetime.now(timezone.utc).isoformat(),
+                     "attempt": self.state["attempt"], **event}
+            self.logfile.write(event)
+            kind = event.get("type")
+            worker = event.get("worker", "")
+            key = (event["attempt"], worker)
+            if kind == "worker_started":
+                self.state["workers_started"] += 1
+                self.active_roles[key] = event.get("role", "")
+                self._active_counts()
+                self.say(f"{worker}: {event['model']} / {event['effort']} "
+                         f"(request effort {event['wire_effort']})")
+            elif kind == "worker_stopped":
+                self.active_roles.pop(key, None)
+                self._active_counts()
+                if not event["usage_complete"]:
+                    self.state["usage_incomplete_workers"] += 1
+            elif kind == "turn.completed":
+                usage = event.get("usage", {})
+                if key not in self.accounted and isinstance(usage, dict):
+                    for field in TOKEN_FIELDS:
+                        value = usage.get(field, 0)
+                        if type(value) is int and value >= 0:
+                            self.state["tokens"][field] += value
+                    self.accounted.add(key)
+            elif kind == "fleet_planned":
+                self.state["fleet_width"] = event["workers"]
+                self.state["fleet_profile"] = event["profile"]
+                detail = ", ".join(f"{event['profile'][name]:,} {label}" for name, label in (
+                    ("documents", "documents"), ("words", "words"), ("headings", "headings"),
+                    ("cross_file_links", "cross-file links")) if name in event["profile"])
+                self.say(f"Fleet plan: {event['workers']} concurrent Luna workers per phase"
+                         + (f" ({detail})." if detail else "."))
+            elif kind == "fleet_started":
+                self.state["fleets_started"] += 1
+                self.state["activity"] = f"{worker}: {event['phase']} fleet"
+                self.say(f"{worker}: starting {event['phase']} fleet with {event['workers']} Luna workers.")
+            elif kind == "fleet_completed":
+                self.state["fleets_completed"] += 1
+                self.say(f"{worker}: {event['phase']} fleet completed ({event['workers']} Luna workers).")
+            elif kind == "fleet_failed":
+                self.state["fleets_failed"] += 1
+                self.say(f"{worker}: {event['phase']} fleet failed: {event['error']}")
+            elif kind == "phase_completed":
+                self.say(f"{worker}: {event['phase']} completed.")
+            elif kind in ("item.started", "item.completed"):
+                item = event.get("item", {})
+                activity = item.get("type", "working")
+                self.state["activity"] = f"{worker}: {activity}"
+                if kind == "item.completed" and activity == "agent_message":
+                    self.say(f"{worker}: {str(item.get('text', ''))[:500]}")
+            self.save()
+
+    def _active_counts(self):
+        """Called with the statistics lock; stopped events need not repeat roles."""
+        self.state["workers_active"] = len(self.active_roles)
+        self.state["children_active"] = sum(role == "child" for role in self.active_roles.values())
+        self.state["parents_active"] = sum(role == "parent" for role in self.active_roles.values())
+        self.state["children_peak"] = max(self.state["children_peak"], self.state["children_active"])
+
+    def status(self, force=False):
+        with self.lock:
+            if not force and time.monotonic() - self.last_status < 5:
+                return
+            self.last_status = time.monotonic()
+            self.save()
+            s = self.state
+            q = s.get("quota") or {}
+            windows = ", ".join(
+                f"{w['bucket_id']}/{w['window']} {w['remaining']:g}%"
+                for w in q.get("windows", [])
+            ) or "unavailable"
+            if q and not q.get("valid", False):
+                windows = "last known " + windows
+            tokens = s["tokens"]["input_tokens"] + s["tokens"]["output_tokens"]
+            self.say(f"Round {s['attempt'] or '-'} | {int(s['elapsed_seconds'])}s | "
+                     f"quota {windows} | floor {s['floor']:g}% + {s['buffer']:g}pp | "
+                     f"{tokens} tokens | {s['children_active']}/{s['fleet_width']} Luna + "
+                     f"{s['parents_active']} Astra | peak {s['children_peak']} Luna | "
+                     f"{s['fleets_completed']} fleets completed | {s['activity']}")
+
+    def close(self):
+        self.logfile.close()
+
+
+class QuotaWatch:
+    def __init__(self, client, guard, control, stats):
+        self.client, self.guard, self.control, self.stats = client, guard, control, stats
+        self.lock = threading.RLock()
+        self.closed = threading.Event()
+        self.thread = None
+        self.failure = None
+
+    def refresh(self):
+        try:
+            response = self.client.read_limits()
+            with self.lock:
+                self.guard.update(response)
+                self.failure = None
+                snapshot = self.guard.snapshot()
+                self.stats.update(quota=snapshot)
+                self.stats.record({"type": "quota_snapshot", "quota": snapshot})
+                return self.guard.check()
+        except QuotaReached:
+            raise
+        except Exception as exc:
+            with self.lock:
+                self.failure = exc
+                snapshot = self.guard.snapshot()
+                if snapshot is not None:
+                    snapshot.update(valid=False, error=str(exc))
+                    self.stats.update(quota=snapshot)
+                self.stats.record({"type": "quota_error", "error": str(exc)})
+            raise
+
+    def recover(self, previous_failure=None):
+        """Read fresh quota before launching workers, with three bounded attempts.
+
+        A failed live poll counts as the first read. Its workers must already be
+        stopped and its edits reset before entering this recovery path.
+        """
+        recovering = previous_failure is not None
+        for index in range(3):
+            self.control.check()
+            try:
+                if index == 0 and previous_failure is not None:
+                    raise previous_failure
+                snapshot = self.refresh()
+            except RetryableQuotaError as exc:
+                recovering = True
+                if index == 2:
+                    raise QuotaError(f"Quota monitoring failed after three read attempts: {exc}") from exc
+                self.client.close()  # Reconnect without forgetting the pinned account.
+                delay = 2 ** index
+                self.stats.update(activity="waiting to retry quota")
+                self.stats.record({"type": "quota_retry", "read_attempt": index + 2,
+                                   "delay_seconds": delay, "error": str(exc)})
+                self.stats.say(f"Quota read failed: {exc}. Retrying in {delay}s "
+                               f"({index + 2}/3); model work is stopped.")
+                self.control.event.wait(delay)
+                self.control.check()
+            else:
+                self.control.check()
+                if recovering:
+                    self.stats.record({"type": "quota_recovered"})
+                    self.stats.say("Fresh quota verified; model work may resume.")
+                return snapshot
+
+    def check(self):
+        self.control.check()
+        with self.lock:
+            try:
+                if isinstance(self.failure, RetryableQuotaError):
+                    raise RoundError(f"Quota monitoring failed: {self.failure}")
+                if self.failure is not None:
+                    raise self.failure
+                return self.guard.check()
+            except QuotaReached as exc:
+                self.control.stop("quota", exc)
+            except QuotaError as exc:
+                snapshot = self.guard.snapshot()
+                if snapshot is not None and self.failure is not None:
+                    snapshot.update(valid=False, error=str(self.failure))
+                self.stats.update(quota=snapshot)
+                self.control.stop("error", exc)
+        self.control.check()
+
+    def start(self):
+        def poll():
+            while not self.closed.wait(5):
+                try:
+                    self.refresh()
+                    self.stats.status()
+                except QuotaReached as exc:
+                    self.control.stop("quota", exc)
+                    break
+                except RetryableQuotaError:
+                    # check() rejects every worker until this attempt is drained.
+                    # Reconnecting here would allow work on an invalid reading.
+                    self.stats.say("Quota read failed; stopping this attempt before recovery.")
+                    break
+                except Exception as exc:
+                    self.control.stop("error", f"Quota monitoring failed: {exc}")
+                    break
+        self.thread = threading.Thread(target=poll, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.closed.set()
+        if self.thread:
+            self.thread.join(timeout=20)
+            if self.thread.is_alive():
+                raise CepsError("Quota reader did not stop; refusing Git changes.")
+        self.client.close()
+
+
+def verify_live_models(catalog):
+    models = {m.get("id", m.get("model")): m for m in catalog.get("data", [])}
+    for model, effort in MODELS.items():
+        entry = models.get(model)
+        supported = [] if not entry else entry.get("supportedReasoningEfforts", [])
+        efforts = {e.get("reasoningEffort") for e in supported if isinstance(e, dict)}
+        if entry is None or effort not in efforts:
+            raise CepsError(f"The authenticated Codex catalog does not offer {model} / {effort}.")
+
+
+def raw_catalog(codex, source_home):
+    env = dict(os.environ, CODEX_HOME=str(source_home))
+    result = subprocess.run([codex, "debug", "models"], cwd=source_home,
+                            env=env, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise CepsError("Cannot read Codex model metadata. Check codex login and configuration.")
+    try:
+        return json.loads(result.stdout)
+    except ValueError as exc:
+        raise CepsError("Codex returned invalid model metadata.") from exc
+
+
+def validate_scope(repo, before):
+    if repo._git("rev-parse", "HEAD").strip() != before:
+        raise CepsError("A worker changed Git history; discarding the round.")
+    names = repo._git("diff", "--name-only", "-z", before, "--").split("\0")
+    names += repo._git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
+    forbidden = [name for name in names if name and not name.startswith("specification/")]
+    if forbidden:
+        raise CepsError("A worker changed paths outside specification/: " + ", ".join(forbidden[:10]))
+
+
+def main(argv=None):
+    args = arguments(sys.argv[1:] if argv is None else argv)
+    os.umask(0o077)
+    state_root = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "ceps"
+    if args.status:
+        try:
+            latest = json.loads((state_root / "latest.json").read_text())
+            print((Path(latest["directory"]) / "stats.json").read_text(), end="")
+            return 0
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"ceps: No readable saved run: {exc}", file=sys.stderr)
+            return 1
+    control = Control()
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda number, _frame: control.stop("signal", f"Received signal {number}."))
+    stats = client = watch = attempt = lock = runtime = None
+    marker = None
+    before = None
+    repo = None
+    result = 1
+    try:
+        enable_supervision()
+        codex = shutil.which("codex")
+        if not codex:
+            raise CepsError("Codex must be installed on PATH.")
+        version = subprocess.check_output([codex, "--version"], text=True, timeout=10).strip()
+        if version not in ("codex-cli 0.156.0", "codex-cli 0.156.1"):
+            raise CepsError(f"This model policy was verified with codex-cli 0.156.0 and 0.156.1; found {version}.")
+        if not (REPO / "prompt.md").is_file() or not (REPO / "specification").is_dir():
+            raise CepsError("Missing prompt.md or specification/ in the ceps repository.")
+        source_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).resolve()
+        repo = GitRepo(REPO)
+        git_dir = Path(repo._git("rev-parse", "--git-common-dir").strip())
+        if not git_dir.is_absolute():
+            git_dir = REPO / git_dir
+        lock = (git_dir / "spec.lock").open("a+")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CepsError("Another spec or ceps run holds this repository's lock.") from exc
+        marker = git_dir / "ceps-incomplete.json"
+        if marker.exists() and not args.check:
+            raise CepsError(f"An earlier run did not finish cleanup. Inspect {marker} before restarting.")
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}"
+        directory = state_root / run_id
+        directory.mkdir(parents=True, mode=0o700)
+        if len(os.fsencode(directory / "999C" / "delegate.sock")) >= 104:
+            raise CepsError("State directory is too long for a Unix socket; set a shorter XDG_STATE_HOME.")
+        stats = Statistics(directory, args.percent, args.buffer)
+        atomic_json(state_root / "latest.json", {"directory": str(directory)})
+        prune_rpc_logs(state_root, directory)
+        repo.log = stats.say
+        stats.say(f"{version}; repository {REPO}; logs {directory}")
+        stats.say("Parent gpt-6-astra / ultra; subagents gpt-6-luna / max.")
+        guard = QuotaGuard(args.percent, args.buffer, models=set(MODELS))
+        client = AccountClient(codex, source_home).start()
+        verify_live_models(client.model_catalog())
+        runtime = prepare_runtime(directory / "runtime", source_home,
+                                  raw_catalog(codex, source_home), codex=codex)
+        shutil.copyfile(HERE / "ceps_mcp.py", runtime.home / "ceps_mcp.py")
+        runtime.env()  # Validate isolated authentication before any Git mutation.
+        validate_launch_configuration(runtime, REPO, directory / "1A" / "delegate.sock")
+        watch = QuotaWatch(client, guard, control, stats)
+        try:
+            watch.recover()
+        except QuotaReached as exc:
+            control.stop("quota", exc)
+        stats.status(force=True)
+        if args.check:
+            stats.update(status="checked", reason=control.reason or "Models and live quota verified.")
+            stats.say(stats.state["reason"] + " No model work or Git writes performed.")
+            result = 0
+        elif control.event.is_set():
+            result = 0
+        else:
+            control.check()
+            repo.prepare()
+            no_changes = 0
+            round_number = 0
+            while not control.event.is_set():
+                round_number += 1
+                before = repo._git("rev-parse", "HEAD").strip()
+                succeeded = False
+                quota_failure = None
+                for retry in range(3):
+                    control.check()
+                    label = f"{round_number}{chr(65 + retry)}"
+                    stats.update(status="running", round=round_number, attempt=label,
+                                 activity="checking quota")
+                    if watch is None:
+                        watch = QuotaWatch(client, guard, control, stats)
+                    try:
+                        quota = watch.recover(quota_failure)
+                        quota_failure = None
+                    except QuotaReached as exc:
+                        control.stop("quota", exc)
+                        break
+                    watch.start()
+                    atomic_json(marker, {"checkpoint": before, "run": str(directory),
+                                         "attempt": label, "status": "incomplete"})
+                    stats.say(f"Starting round {label}.")
+                    attempt = Attempt(runtime, REPO, directory / label, control,
+                                      watch.check, stats.record)
+                    failure = None
+                    summary = ""
+                    try:
+                        summary = attempt.run(make_prompt(REPO, label, quota))
+                    except RoundError as exc:
+                        failure = str(exc)
+                    except Stopped:
+                        pass
+                    finally:
+                        attempt.close()
+                        attempt = None
+                        watch.close()
+                        # Include a poll failure racing the parent's completion.
+                        # No incomplete attempt may reach Git finalization.
+                        if isinstance(watch.failure, RetryableQuotaError):
+                            quota_failure = watch.failure
+                            failure = f"Quota monitoring failed: {quota_failure}"
+                        watch = None
+                        drain_descendants()
+                    if control.event.is_set():
+                        repo.reset_round(before)
+                        before = None
+                        marker.unlink(missing_ok=True)
+                        break
+                    if failure is not None:
+                        stats.state["failed_attempts"] += 1
+                        stats.say(f"Round {label} failed: {failure}")
+                        stats.record({"type": "attempt_failed", "error": failure})
+                        repo.reset_round(before)
+                        marker.unlink(missing_ok=True)
+                        if retry == 2:
+                            raise CepsError(f"Round {round_number} failed after three attempts.")
+                        continue
+                    validate_scope(repo, before)
+                    control.check()
+                    checkpoint = before
+                    # Completed changes survive a Git failure, as they do with spec.
+                    before = None
+                    atomic_json(marker, {"checkpoint": checkpoint, "run": str(directory),
+                                         "attempt": label, "status": "reviewed"})
+                    stats.update(activity="committing and pushing")
+                    after = repo.finalize("Checkpoint autonomous specification improvements (ceps)")
+                    marker.unlink(missing_ok=True)
+                    stats.state["completed_rounds"] += 1
+                    stats.state["checkpoints"].append(after)
+                    stats.record({"type": "round_completed", "checkpoint": after,
+                                  "summary": summary})
+                    no_changes = no_changes + 1 if after == checkpoint else 0
+                    stats.status(force=True)
+                    prune_rpc_logs(state_root, directory)
+                    if no_changes >= 3:
+                        raise CepsError("Three completed rounds made no commits; stopping.")
+                    succeeded = True
+                    break
+                if not succeeded:
+                    break
+            result = 0
+    except Stopped:
+        result = 0
+    except QuotaReached as exc:
+        control.stop("quota", exc)
+        result = 0
+    except Exception as exc:
+        control.stop("error", exc)
+        if stats:
+            stats.say(f"ERROR: {exc}")
+        else:
+            print(f"ceps: {clean(exc)}", file=sys.stderr)
+    finally:
+        try:
+            if attempt:
+                attempt.close()
+            if watch:
+                watch.close()
+            elif client:
+                client.close()
+            drain_descendants()
+            if runtime:
+                runtime.clear_credentials()
+            if before is not None and repo is not None:
+                repo.reset_round(before)
+                if marker:
+                    marker.unlink(missing_ok=True)
+        except Exception as exc:
+            control.stop("error", f"Cleanup failed; work preserved: {exc}")
+        if control.kind == "error":
+            result = 1
+        elif control.kind == "signal":
+            result = 130
+        if stats:
+            if not args.check or result != 0:
+                stats.update(status="error" if result == 1 else "interrupted" if result == 130 else "stopped",
+                             reason=control.reason or "Finished.", activity="stopped")
+            stats.status(force=True)
+            stats.say(stats.state["reason"])
+            stats.close()
+        if lock:
+            lock.close()
+    return result
+
+
+if __name__ == "__main__":
+    sys.exit(main())

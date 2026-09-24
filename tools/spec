@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""Run autonomous specification improvements with a dollar budget."""
+
+from __future__ import annotations
+
+import decimal
+import ctypes
+import fcntl
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from spec_git import GitError, GitRepo
+from spec_logs import BoundedJsonlLog, compact_event, prune_rpc_logs
+
+RESERVE = decimal.Decimal("1.00")
+MAX_ATTEMPTS = 3
+REPO = HERE.parent
+
+
+class SpecError(Exception):
+    pass
+
+
+class RoundError(SpecError):
+    """An incomplete attempt that can be retried after rollback and accounting."""
+
+
+def parse_budget(args):
+    if len(args) != 1 or not re.fullmatch(r"[0-9]+(?:\.[0-9]{1,2})?", args[0]):
+        raise SpecError("Usage: spec DOLLARS (example: spec 42.42; minimum $2.00)")
+    amount = decimal.Decimal(args[0])
+    if amount < 2:
+        raise SpecError("The minimum budget is $2.00, including the $1.00 reserve.")
+    if amount > decimal.Decimal("9000000"):
+        raise SpecError("Budget exceeds the supported dollar precision.")
+    return amount
+
+
+def clean_text(value):
+    # Model/tool output must not inject terminal escape sequences.
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(value)).strip()
+
+
+class Display:
+    def __init__(self, budget):
+        self.budget = budget
+        self.started = time.monotonic()
+        self.last_status = 0.0
+        self.activity = "starting"
+        self.iteration = 0
+        self.attempt = 0
+
+    @property
+    def round_label(self):
+        return f"{self.iteration}{chr(ord('A') + self.attempt)}"
+
+    def log(self, message):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        print(f"[{stamp}] {clean_text(message)}", flush=True)
+
+    def status(self, state, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_status < 5:
+            return
+        self.last_status = now
+        spent = decimal.Decimal(str(state.get("spent", 0)))
+        remaining = self.budget - spent
+        elapsed = int(now - self.started)
+        accounting = "accounted (includes estimates)" if state.get("estimatedSpend") else "spent"
+        held = decimal.Decimal(str(state.get("reserved", 0)))
+        self.log(
+            f"Round {self.round_label} | ${spent:.4f} {accounting} | ${remaining:.4f} remaining "
+            f"(${RESERVE:.2f} reserved) | {elapsed // 60}m {elapsed % 60:02d}s | "
+            f"${held:.4f} in flight | {self.activity}"
+        )
+
+
+class RpcWorker:
+    """One OMP process per improvement; no state is inferred from a stale PID file."""
+
+    def __init__(self, command, cwd, env, run_dir, iteration, attempt=0):
+        # OMP's native shell uses setsid(), so process-group signals alone are
+        # insufficient. Adopt orphaned descendants even if their parent crashes.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER, Linux
+            raise SpecError("Cannot enable child-process supervision on this machine.")
+        self.events = queue.Queue()
+        self.event_log = BoundedJsonlLog(run_dir / "events.jsonl")
+        self.event_log.write({"type": "round_start", "round": iteration,
+                              "attempt": chr(ord('A') + attempt)})
+        self.process = subprocess.Popen(
+            command, cwd=cwd, env=env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", start_new_session=True,
+        )
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+        self.stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
+        self.stderr_reader.start()
+        self.counter = 0
+
+    @staticmethod
+    def descendants():
+        parents = {}
+        for entry in Path("/proc").iterdir():
+            if entry.name.isdigit():
+                try:
+                    stat = (entry / "stat").read_text()
+                    fields = stat[stat.rfind(")") + 2:].split()
+                    parents[int(entry.name)] = int(fields[1])
+                except (OSError, ValueError, IndexError):
+                    continue
+        owned = {os.getpid()}
+        while True:
+            more = {pid for pid, parent in parents.items() if parent in owned} - owned
+            if not more:
+                return owned - {os.getpid()}
+            owned.update(more)
+
+    @classmethod
+    def drain_descendants(cls):
+        # All children of this dedicated supervisor belong to this round;
+        # Git is run only after this method proves none remain.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            children = cls.descendants()
+            if not children:
+                return
+            for pid in children:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for pid in children:
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+            time.sleep(0.02)
+        raise SpecError("Worker descendants are still alive; refusing to finalize Git.")
+
+    def _read(self):
+        try:
+            for line in self.process.stdout:
+                try:
+                    event = json.loads(line)
+                    if not isinstance(event, dict):
+                        raise ValueError("RPC frame is not an object")
+                except ValueError:
+                    event = {"type": "invalid_frame"}
+                event = compact_event(event)
+                self.event_log.write(event)
+                self.events.put(event)
+        finally:
+            self.events.put({"type": "eof"})
+
+    def _read_stderr(self):
+        try:
+            for chunk in iter(lambda: self.process.stderr.read(4096), ""):
+                self.event_log.write({"type": "worker_stderr", "text": chunk})
+        except (OSError, ValueError):
+            # A logging failure must stop paid work rather than silently keep
+            # running without diagnostics.
+            self.events.put({"type": "invalid_frame"})
+
+    def send(self, kind, **values):
+        self.counter += 1
+        request_id = f"spec-{self.counter}"
+        try:
+            self.process.stdin.write(json.dumps({"id": request_id, "type": kind, **values}) + "\n")
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise RoundError("Oh My Pi stopped unexpectedly; see the run logs.") from exc
+        return request_id
+
+    def event(self, timeout=0.25):
+        try:
+            return self.events.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def request(self, kind, timeout=30, **values):
+        request_id = self.send(kind, **values)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            event = self.event()
+            if not event:
+                continue
+            if event.get("type") in ("eof", "invalid_frame"):
+                raise RoundError("Oh My Pi did not provide a valid RPC response; see the run logs.")
+            if event.get("id") == request_id:
+                if not event.get("success"):
+                    raise SpecError(f"Oh My Pi {kind}: {event.get('error', 'request failed')}")
+                return event.get("data", {})
+        raise RoundError(f"Timed out waiting for Oh My Pi {kind}.")
+
+    def stop(self):
+        """Abort, then stop the entire process group before any Git finalization."""
+        if self.process.poll() is None:
+            try:
+                self.request("abort", timeout=10)
+            except SpecError:
+                pass
+        try:
+            os.killpg(self.process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        # Children may survive their group leader. Kill the group even after it exits.
+        try:
+            os.killpg(self.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self.process.wait(timeout=5)
+        self.drain_descendants()
+        if self.process.stdin:
+            self.process.stdin.close()
+        self.reader.join(timeout=5)
+        self.stderr_reader.join(timeout=5)
+        if self.reader.is_alive() or self.stderr_reader.is_alive():
+            raise SpecError("Worker output is still open after shutdown; refusing to finalize Git.")
+        self.process.stdout.close()
+        self.process.stderr.close()
+        self.event_log.close()
+
+
+def read_state(path):
+    try:
+        state = json.loads(path.read_text())
+        if not isinstance(state, dict):
+            raise ValueError("not an object")
+        for key in ("spent", "reserved", "limit"):
+            if type(state[key]) not in (int, float):
+                raise ValueError(f"invalid {key} type")
+            amount = decimal.Decimal(str(state[key]))
+            if not amount.is_finite() or amount < 0:
+                raise ValueError(f"invalid {key} value")
+        for key in ("inFlight", "requests", "settledRequests"):
+            if type(state[key]) is not int or state[key] < 0:
+                raise ValueError(f"invalid {key} count")
+        if state["settledRequests"] > state["requests"]:
+            raise ValueError("invalid settled request count")
+        return state
+    except (OSError, ValueError, KeyError, decimal.InvalidOperation) as exc:
+        raise SpecError("Budget accounting is unavailable; stopping paid work.") from exc
+
+
+def settle_shutdown(path):
+    """After all writers exit, conservatively account for any unreported request."""
+    state = read_state(path)
+    if state.get("reserved", 0) > 0:
+        state["spent"] = float(decimal.Decimal(str(state["spent"])) +
+                               decimal.Decimal(str(state["reserved"])))
+        state["settledRequests"] += state["inFlight"]
+        state.update(reserved=0, inFlight=0, estimatedSpend=True)
+        # Uncertain usage is charged before retrying, but cannot erase a hard
+        # accounting failure or a budget stop that was already recorded.
+        if not state.get("stopped") or (state.get("stopKind") == "error"
+                                         and state.get("retryable") is True):
+            state.update(stopped=True, stopKind="error", retryable=True)
+            state["reason"] = state.get("reason") or (
+                "Stopped with unreported usage; accounted for its reserved maximum.")
+        state["remaining"] = state["limit"] - state["spent"]
+        state["available"] = max(0, state["remaining"] - 1)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state) + "\n")
+        temporary.replace(path)
+    return state
+
+
+def prepare_retry(path, budget):
+    """Rearm a stopped, settled ledger without refunding failed requests."""
+    state = read_state(path)
+    if (type(state.get("version")) is not int or state["version"] != 1
+            or decimal.Decimal(str(state["limit"])) != budget
+            or type(state.get("reserve")) not in (int, float) or state["reserve"] != 1
+            or type(state.get("stopped")) is not bool
+            or type(state.get("retryable", False)) is not bool
+            or state.get("stopKind") not in (("error", "budget") if state["stopped"] else ("",))
+            or state["reserved"] != 0 or state["inFlight"] != 0
+            or state["settledRequests"] != state["requests"]):
+        raise SpecError("Budget accounting cannot be confirmed; refusing to retry.")
+    if state.get("stopped") and state.get("stopKind") == "budget":
+        return False
+    if state.get("stopped") and not (state.get("stopKind") == "error"
+                                      and state.get("retryable") is True):
+        raise SpecError(state.get("reason", "Budget accounting stopped the run."))
+    can_retry = decimal.Decimal(str(state["spent"])) < budget - RESERVE
+    if can_retry:
+        state.update(stopped=False, stopKind="", reason="", retryable=False)
+    else:
+        state.update(stopped=True, stopKind="budget", retryable=False,
+                     reason="Budget allowance exhausted after accounting for the failed attempt.")
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state) + "\n")
+    temporary.replace(path)
+    return can_retry
+
+
+def accounting_error(state):
+    error_type = RoundError if state.get("retryable") is True else SpecError
+    return error_type(state.get("reason", "Budget accounting stopped the run."))
+
+
+def overlay():
+    # Disable unobserved auxiliary model calls and background workers. Subagents still run,
+    # synchronously, with the same inherited budget guard.
+    return {
+        "async": {"enabled": False},
+        "advisor": {"enabled": False},
+        "prewalk": {"enabled": False},
+        "compaction": {
+            "enabled": False, "midTurnEnabled": False, "asyncEnabled": False,
+            "idleEnabled": False, "autoContinue": False,
+        },
+        "memory": {"backend": "off"},
+        "retry": {"enabled": False, "modelFallback": False},
+        "title": {"refreshOnReplan": False},
+        "task": {
+            "maxConcurrency": 1, "isolation": {"enabled": False},
+            "prewalk": False, "agentAdvisor": {}, "agentPrewalk": {},
+        },
+    }
+
+
+def make_prompt(repo, iteration, state, attempt=0):
+    return (
+        f"Autonomous specification improvement, round {iteration}{chr(ord('A') + attempt)} "
+        f"(attempt {attempt + 1} of {MAX_ATTEMPTS}).\n\n"
+        "Follow the project instructions below and complete one small, valuable improvement. "
+        "Work only on specification/; do not change the product's established intent. "
+        "Use task subagents for understanding, planning, and review as instructed. "
+        "All model work must use this session or its task subagents; never start another "
+        "LLM client through shell commands. Do not modify the runner, its budget files, "
+        "prompt.md, or metaspecification/. Do not start background or detached processes. "
+        "Work autonomously without asking questions. Resolve routine choices from the seed. "
+        "Finish review and give a concise account of the completed improvement. "
+        "Then stop; the supervisor will start another round if budget remains. "
+        f"Budget remaining before this round: ${float(state.get('remaining', 0)):.4f}; "
+        "$1.00 is reserved and unavailable for model calls. Keep changes small enough to "
+        "finish within the allowance; incomplete rounds will be discarded.\n\n"
+        + (repo / "prompt.md").read_text()
+        + "\n\nFor this supervised run, the supervisor handles all version control writes. "
+        "This overrides the prepare and finish version control instructions above: "
+        "do not pull, stage, commit, push, switch branches, or reset, including through "
+        "subagents. Read-only Git inspection is allowed. Leave the reviewed changes in "
+        "the working tree; the supervisor commits and pushes only after the round completes.\n"
+    )
+
+
+def run_round(worker, display, state_path, interrupted):
+    state = worker.request("get_state")
+    model = state.get("model") or {}
+    display.log(f"Model: {model.get('provider', '?')}/{model.get('id', '?')}")
+    if model.get("provider") != "deepseek" or model.get("api") != "openai-completions":
+        raise SpecError("This installation requires a DeepSeek Chat Completions model.")
+    worker.request("set_subagent_subscription", level="events")
+    # Loading our explicit extension must create this file before any paid prompt.
+    budget_state = read_state(state_path)
+    if budget_state.get("pid") != worker.process.pid or budget_state.get("version") != 1:
+        raise SpecError("Oh My Pi did not load the budget guard; refusing to send a paid prompt.")
+    if budget_state.get("stopped"):
+        if budget_state.get("stopKind") != "budget":
+            raise accounting_error(budget_state)
+        return "budget"
+    worker.send("prompt", message=make_prompt(REPO, display.iteration, budget_state, display.attempt))
+    last_activity = time.monotonic()
+    final_error = None
+    final_stop_reason = None
+    while True:
+        if interrupted.is_set():
+            return "interrupted"
+        budget_state = read_state(state_path)
+        display.status(budget_state)
+        if budget_state.get("stopped"):
+            display.log(budget_state.get("reason", "Budget reserve reached."))
+            if budget_state.get("stopKind") != "budget":
+                raise accounting_error(budget_state)
+            return "budget"
+        event = worker.event()
+        if event is None:
+            if time.monotonic() - last_activity > 600:
+                raise RoundError("Oh My Pi produced no events for ten minutes; stopping safely.")
+            continue
+        kind = event.get("type")
+        last_activity = time.monotonic()
+        if kind in ("eof", "invalid_frame"):
+            raise RoundError("Oh My Pi stopped or sent invalid output; see the run logs.")
+        if kind == "response" and not event.get("success"):
+            raise RoundError(f"Oh My Pi: {event.get('error', 'request failed')}")
+        child = kind == "subagent_event"
+        if child:
+            payload = event.get("payload", {})
+            event = payload.get("event", {})
+            kind = event.get("type")
+        prefix = "Subagent: " if child else ""
+        if kind == "tool_execution_start":
+            display.activity = prefix + str(event.get("toolName", "tool"))
+            display.log(display.activity)
+        elif kind == "message_update":
+            update = event.get("assistantMessageEvent", {})
+            if "thinking" in update.get("type", ""):
+                display.activity = prefix + "thinking"
+            elif "text" in update.get("type", ""):
+                display.activity = prefix + "writing"
+        elif kind == "message_end":
+            message = event.get("message", {})
+            if message.get("role") == "assistant":
+                if not child:
+                    final_stop_reason = message.get("stopReason")
+                if message.get("stopReason") in ("error", "aborted"):
+                    final_error = message.get("errorMessage", "Model request failed or was aborted.")
+                parts = [p.get("text", "") for p in message.get("content", []) if p.get("type") == "text"]
+                if parts:
+                    display.log(prefix + clean_text(" ".join(parts))[:350])
+        elif kind == "extension_error":
+            raise SpecError("The budget extension reported an error; see the run logs.")
+        elif kind == "agent_end" and not child:
+            if event.get("isTerminal") is False:
+                continue
+            # agent_end is emitted before settlement; checking RPC ensures the turn is idle.
+            current = worker.request("get_state")
+            if not current.get("isStreaming") and not current.get("isCompacting"):
+                if final_error:
+                    raise RoundError(clean_text(final_error)[:500])
+                if final_stop_reason != "stop":
+                    raise RoundError("Oh My Pi ended without a completed assistant response.")
+                return "complete"
+
+
+def main(args):
+    try:
+        budget = parse_budget(args)
+    except SpecError as exc:
+        print(f"spec: {exc}", file=sys.stderr)
+        return 2
+    os.umask(0o077)
+    display = Display(budget)
+    interrupted = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda _sig, _frame: interrupted.set())
+    worker = None
+    repo = None
+    round_start = None
+    lock = None
+    result = 0
+    state_path = None
+    try:
+        omp = shutil.which("omp")
+        if not omp:
+            raise SpecError("Oh My Pi (omp) is not installed on PATH.")
+        if not (REPO / "prompt.md").is_file() or not (REPO / "specification").is_dir():
+            raise SpecError(f"The specification repository is missing at {REPO}.")
+        repo = GitRepo(REPO, log=display.log)
+        git_dir = subprocess.check_output(
+            ["git", "rev-parse", "--git-common-dir"], cwd=REPO, text=True,
+        ).strip()
+        lock = (REPO / git_dir / "spec.lock").open("a+")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SpecError("Another spec run already holds this repository's lock.") from exc
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}"
+        run_dir = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "spec" / run_id
+        run_dir.mkdir(parents=True, mode=0o700)
+        prune_rpc_logs(run_dir.parent, run_dir)
+        state_path = run_dir / "budget.json"
+        config_path = run_dir / "config.yml"
+        config_path.write_text(json.dumps(overlay()))
+        display.log(f"Budget ${budget:.2f}; work allowance ${budget - RESERVE:.2f}; reserve ${RESERVE:.2f}.")
+        display.log(f"Repository: {REPO}; logs: {run_dir}")
+        repo.prepare()
+        # Only the supervisor may publish a round. Disable Git transports in
+        # workers (and inherited subagents), while retaining local inspection.
+        env = dict(os.environ, SPEC_BUDGET_USD=str(budget), SPEC_BUDGET_STATE=str(state_path),
+                   GIT_ALLOW_PROTOCOL="")
+        no_change_rounds = 0
+        while not interrupted.is_set():
+            display.iteration += 1
+            before = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
+            command = [
+                omp, "--mode", "rpc", "--no-title", "--no-extensions", "--no-pty",
+                "--no-lsp", "--auto-approve", "--config", str(config_path),
+                "--session-dir", str(run_dir / "sessions"),
+                "--extension", str(HERE / "spec-budget.ts"),
+            ]
+            outcome = "interrupted"
+            for attempt in range(MAX_ATTEMPTS):
+                if interrupted.is_set():
+                    outcome = "interrupted"
+                    break
+                display.attempt = attempt
+                round_start = before
+                display.activity = "starting Oh My Pi"
+                display.log(f"Starting improvement round {display.round_label}.")
+                worker = RpcWorker(command, REPO, env, run_dir, display.iteration, attempt)
+                failure = None
+                try:
+                    outcome = run_round(worker, display, state_path, interrupted)
+                except RoundError as exc:
+                    failure = exc
+                    outcome = "failed"
+                worker.stop()
+                worker = None
+                settled = settle_shutdown(state_path)
+                if interrupted.is_set():
+                    outcome = "interrupted"
+                elif settled.get("stopped"):
+                    if settled.get("stopKind") == "budget":
+                        outcome = "budget"
+                    else:
+                        error = accounting_error(settled)
+                        if not isinstance(error, RoundError):
+                            raise error
+                        failure = error
+                        outcome = "failed"
+                if outcome == "complete":
+                    break
+                if failure:
+                    display.log(f"Round {display.round_label} failed: {failure}")
+                display.activity = "resetting incomplete round"
+                repo.reset_round(before)
+                round_start = None
+                display.status(settled, force=True)
+                if outcome in ("budget", "interrupted"):
+                    break
+                if attempt + 1 == MAX_ATTEMPTS:
+                    raise SpecError(f"Round {display.iteration} failed after {MAX_ATTEMPTS} attempts.")
+                # Only a fresh attempt may clear a recoverable stop, after all
+                # writers are gone and every edit from the failed attempt is reset.
+                if not prepare_retry(state_path, budget):
+                    display.log("Budget allowance exhausted; no further attempts will start.")
+                    outcome = "budget"
+                    break
+            if outcome != "complete":
+                if outcome == "interrupted":
+                    result = 130
+                break
+            # A completed round must survive Git failures for a later retry.
+            # Clear rollback eligibility before staging or pushing its changes.
+            round_start = None
+            display.activity = "committing and pushing"
+            after = repo.finalize()
+            prune_rpc_logs(run_dir.parent, run_dir)
+            display.status(settled, force=True)
+            no_change_rounds = no_change_rounds + 1 if after == before else 0
+            if no_change_rounds >= 3:
+                raise SpecError("Three rounds made no commits; stopping to avoid wasting credits.")
+        if interrupted.is_set():
+            result = 130
+    except (SpecError, GitError, OSError, subprocess.SubprocessError) as exc:
+        display.log(f"ERROR: {exc}")
+        result = 1
+    finally:
+        stopped = True
+        if worker:
+            try:
+                worker.stop()
+            except Exception as exc:
+                display.log(f"ERROR stopping worker: {exc}")
+                stopped = False
+                result = 1
+        if round_start is not None and stopped:
+            try:
+                display.activity = "resetting incomplete round"
+                repo.reset_round(round_start)
+            except (GitError, OSError) as exc:
+                display.log(f"ERROR resetting incomplete round: {exc}")
+                result = 1
+        if state_path and state_path.exists():
+            try:
+                display.activity = "stopped"
+                final_state = settle_shutdown(state_path) if stopped else read_state(state_path)
+                display.status(final_state, force=True)
+                if final_state.get("stopKind") == "error" and result == 0:
+                    display.log(f"ERROR: {final_state.get('reason', 'Usage could not be confirmed.')}")
+                    result = 1
+            except SpecError:
+                pass
+        if lock:
+            lock.close()
+    if result == 0:
+        display.log("Finished. Completed rounds are committed and pushed; incomplete work was reset.")
+    elif result == 130:
+        display.log("Interrupted. Completed rounds are committed and pushed; incomplete work was reset.")
+    else:
+        display.log("Stopped with an error. Check the messages above and run logs.")
+    return result
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
